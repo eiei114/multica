@@ -24,7 +24,7 @@ permissions:
 
 concurrency:
   group: android-auto-build
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   sync:
