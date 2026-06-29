@@ -8,7 +8,7 @@ on:
         type: boolean
         default: true
       publish_release:
-        description: "Publish the APK to a GitHub Release"
+        description: "Publish the APK to the android-latest GitHub Release"
         type: boolean
         default: true
       package_id:
@@ -21,6 +21,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: android-auto-build
@@ -31,8 +32,10 @@ jobs:
     name: Sync upstream/main into android-build
     if: github.repository == 'eiei114/multica'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       changed: ${{ steps.sync.outputs.changed }}
+      mobile_changed: ${{ steps.sync.outputs.mobile_changed }}
       head_sha: ${{ steps.sync.outputs.head_sha }}
       short_sha: ${{ steps.sync.outputs.short_sha }}
     steps:
@@ -58,12 +61,19 @@ jobs:
           before="$(git rev-parse HEAD)"
           if git merge --no-edit upstream/main; then
             after="$(git rev-parse HEAD)"
+            changed=false
+            mobile_changed=false
+
             if [ "$before" != "$after" ]; then
+              changed=true
+              if git diff --name-only "$before" "$after" | grep -E '^(apps/mobile/|packages/core/|package.json|pnpm-lock.yaml|pnpm-workspace.yaml|turbo.json|scripts/build-android|\.github/workflows/android-auto-build\.yml)' >/dev/null; then
+                mobile_changed=true
+              fi
               git push origin HEAD:android-build
-              echo "changed=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "changed=false" >> "$GITHUB_OUTPUT"
             fi
+
+            echo "changed=$changed" >> "$GITHUB_OUTPUT"
+            echo "mobile_changed=$mobile_changed" >> "$GITHUB_OUTPUT"
             echo "head_sha=$after" >> "$GITHUB_OUTPUT"
             echo "short_sha=${after:0:12}" >> "$GITHUB_OUTPUT"
           else
@@ -77,12 +87,14 @@ jobs:
     needs: sync
     if: >-
       github.repository == 'eiei114/multica' &&
-      (needs.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch' && inputs.force_build)
-    runs-on: windows-latest
+      (needs.sync.outputs.mobile_changed == 'true' || github.event_name == 'workflow_dispatch' && inputs.force_build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       APP_ENV: production
       EXPO_ANDROID_PACKAGE_PROD: ${{ inputs.package_id || 'ai.multica.mobile.eiei114' }}
       EXPO_BUNDLE_IDENTIFIER_PROD: ai.multica.mobile.eiei114
+      EXPO_ANDROID_UPDATE_REPO: eiei114/multica
       EXPO_ANDROID_VERSION_CODE: ${{ github.run_number }}
       EXPO_APP_VERSION: 0.1.0-android.${{ github.run_number }}
       ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -113,52 +125,64 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
+      - name: Setup Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Restore Expo cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.expo
+          key: expo-${{ runner.os }}-${{ hashFiles('apps/mobile/package.json', 'pnpm-lock.yaml') }}
+          restore-keys: |
+            expo-${{ runner.os }}-
+
       - name: Restore Android signing key
-        shell: pwsh
+        shell: bash
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
-          if (-not $env:ANDROID_KEYSTORE_BASE64) {
-            throw "ANDROID_KEYSTORE_BASE64 secret is required"
-          }
-          $keystorePath = Join-Path $env:RUNNER_TEMP "multica-android-release.jks"
-          [System.IO.File]::WriteAllBytes($keystorePath, [System.Convert]::FromBase64String($env:ANDROID_KEYSTORE_BASE64))
-          "ANDROID_KEYSTORE_PATH=$keystorePath" >> $env:GITHUB_ENV
+          set -euo pipefail
+          if [ -z "${ANDROID_KEYSTORE_BASE64:-}" ]; then
+            echo "ANDROID_KEYSTORE_BASE64 secret is required" >&2
+            exit 1
+          fi
+          keystore_path="$RUNNER_TEMP/multica-android-release.jks"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore_path"
+          echo "ANDROID_KEYSTORE_PATH=$keystore_path" >> "$GITHUB_ENV"
 
       - name: Build release APK
-        shell: pwsh
-        run: |
-          powershell -ExecutionPolicy Bypass -File scripts/build-android-debug.ps1 `
-            -AppEnvironment production `
-            -BuildType Release
+        shell: bash
+        run: bash scripts/build-android-release.sh
 
       - name: Stage APK and update metadata
         id: package
-        shell: pwsh
+        shell: bash
         run: |
-          $artifactDir = "artifacts/android"
-          New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
+          set -euo pipefail
+          artifact_dir="artifacts/android"
+          mkdir -p "$artifact_dir"
 
-          $apkSource = "apps/mobile/android/app/build/outputs/apk/release/app-release.apk"
-          $apkName = "multica-android-${{ github.run_number }}.apk"
-          $apkDest = Join-Path $artifactDir $apkName
-          $metadataPath = Join-Path $artifactDir "android-update.json"
-          Copy-Item $apkSource $apkDest -Force
+          apk_source="apps/mobile/android/app/build/outputs/apk/release/app-release.apk"
+          apk_name="multica-android-latest.apk"
+          apk_dest="$artifact_dir/$apk_name"
+          metadata_path="$artifact_dir/android-update.json"
+          cp "$apk_source" "$apk_dest"
 
-          $metadata = [ordered]@{
-            versionCode = [int]"${{ github.run_number }}"
-            versionName = "0.1.0-android.${{ github.run_number }}"
-            packageId = "${{ env.EXPO_ANDROID_PACKAGE_PROD }}"
-            commit = "${{ needs.sync.outputs.head_sha }}"
-            branch = "android-build"
-            builtAt = (Get-Date).ToUniversalTime().ToString("o")
-            apk = $apkName
-          }
-          $metadata | ConvertTo-Json | Set-Content -Encoding UTF8 $metadataPath
-
-          "apk_path=$apkDest" >> $env:GITHUB_OUTPUT
-          "metadata_path=$metadataPath" >> $env:GITHUB_OUTPUT
-          "tag=android-${{ github.run_number }}" >> $env:GITHUB_OUTPUT
+          node - <<'NODE'
+          const fs = require('fs');
+          const metadata = {
+            versionCode: Number(process.env.GITHUB_RUN_NUMBER),
+            versionName: `0.1.0-android.${process.env.GITHUB_RUN_NUMBER}`,
+            packageId: process.env.EXPO_ANDROID_PACKAGE_PROD,
+            commit: process.env.HEAD_SHA,
+            branch: 'android-build',
+            builtAt: new Date().toISOString(),
+            apk: 'multica-android-latest.apk',
+          };
+          fs.writeFileSync('artifacts/android/android-update.json', JSON.stringify(metadata, null, 2));
+          NODE
+        env:
+          HEAD_SHA: ${{ needs.sync.outputs.head_sha }}
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v5
@@ -167,17 +191,19 @@ jobs:
           path: artifacts/android/*
           retention-days: 30
 
-      - name: Publish GitHub Release
+      - name: Publish android-latest GitHub Release
         if: github.event_name == 'schedule' || inputs.publish_release
-        shell: pwsh
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "${{ steps.package.outputs.tag }}"
-          gh release create $tag `
-            "${{ steps.package.outputs.apk_path }}" `
-            "${{ steps.package.outputs.metadata_path }}" `
-            --repo "${{ github.repository }}" `
-            --target android-build `
-            --title "Android APK ${{ github.run_number }}" `
+          set -euo pipefail
+          gh release delete android-latest --repo "${{ github.repository }}" --yes --cleanup-tag || true
+          gh release create android-latest \
+            artifacts/android/multica-android-latest.apk \
+            artifacts/android/android-update.json \
+            --repo "${{ github.repository }}" \
+            --target android-build \
+            --latest \
+            --title "Android APK latest" \
             --notes "Automated private Android APK build from android-build at ${{ needs.sync.outputs.short_sha }}."

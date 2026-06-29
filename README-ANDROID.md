@@ -116,9 +116,14 @@ The workflow:
 3. Pushes the merge back to `origin/android-build` when upstream changed.
 4. Builds a production Android release APK on GitHub Actions.
 5. Uploads the APK as a workflow artifact.
-6. Publishes a GitHub Release with:
-   - `multica-android-<run_number>.apk`
+6. Replaces the `android-latest` GitHub Release with:
+   - `multica-android-latest.apk`
    - `android-update.json`
+
+The build runs on Ubuntu with Gradle and Expo caches. Scheduled runs only build
+when upstream changed mobile-relevant paths (`apps/mobile/`, `packages/core/`,
+package manager files, or Android build scripts/workflow). Manual dispatch can
+force a build.
 
 The scheduled run is daily at `06:15 JST`.
 
