@@ -85,6 +85,9 @@ jobs:
       EXPO_BUNDLE_IDENTIFIER_PROD: ai.multica.mobile.eiei114
       EXPO_ANDROID_VERSION_CODE: ${{ github.run_number }}
       EXPO_APP_VERSION: 0.1.0-android.${{ github.run_number }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
     steps:
       - name: Checkout android-build
         uses: actions/checkout@v6
@@ -109,6 +112,18 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+
+      - name: Restore Android signing key
+        shell: pwsh
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if (-not $env:ANDROID_KEYSTORE_BASE64) {
+            throw "ANDROID_KEYSTORE_BASE64 secret is required"
+          }
+          $keystorePath = Join-Path $env:RUNNER_TEMP "multica-android-release.jks"
+          [System.IO.File]::WriteAllBytes($keystorePath, [System.Convert]::FromBase64String($env:ANDROID_KEYSTORE_BASE64))
+          "ANDROID_KEYSTORE_PATH=$keystorePath" >> $env:GITHUB_ENV
 
       - name: Build release APK
         shell: pwsh

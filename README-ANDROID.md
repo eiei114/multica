@@ -138,6 +138,22 @@ The private fork APK uses this package id by default:
 ai.multica.mobile.eiei114
 ```
 
+Release APKs are signed with the fixed private fork key stored in GitHub
+Actions secrets:
+
+```text
+ANDROID_KEYSTORE_BASE64
+ANDROID_KEYSTORE_PASSWORD
+ANDROID_KEY_ALIAS
+ANDROID_KEY_PASSWORD
+```
+
+The local backup for this personal fork lives outside the repository at:
+
+```text
+%USERPROFILE%\.multica-android-signing\
+```
+
 That means it installs separately from the current development-client APK
 (`ai.multica.mobile.dev`). This is deliberate: the automated APK is a
 standalone production bundle, while the dev APK is for Metro-based local work.

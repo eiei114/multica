@@ -40,6 +40,59 @@ function Require-Command {
   }
 }
 
+function Enable-ReleaseSigningFromEnv {
+  param([string]$BuildGradlePath)
+
+  if (-not $env:ANDROID_KEYSTORE_PATH) {
+    Write-Host "ANDROID_KEYSTORE_PATH is not set; release builds will use the generated default signing config."
+    return
+  }
+
+  if (-not (Test-Path $env:ANDROID_KEYSTORE_PATH)) {
+    throw "ANDROID_KEYSTORE_PATH does not exist: $env:ANDROID_KEYSTORE_PATH"
+  }
+
+  foreach ($name in @("ANDROID_KEYSTORE_PASSWORD", "ANDROID_KEY_ALIAS", "ANDROID_KEY_PASSWORD")) {
+    if (-not [Environment]::GetEnvironmentVariable($name)) {
+      throw "$name is required when ANDROID_KEYSTORE_PATH is set"
+    }
+  }
+
+  $text = Get-Content $BuildGradlePath -Raw
+  if ($text -notmatch "(?s)signingConfigs\s*\{.*?release\s*\{") {
+    $releaseSigning = @'
+    release {
+        def keystorePath = System.getenv("ANDROID_KEYSTORE_PATH")
+        if (keystorePath == null || keystorePath.length() == 0) {
+            throw new GradleException("ANDROID_KEYSTORE_PATH is required for release signing")
+        }
+        storeFile file(keystorePath)
+        storePassword System.getenv("ANDROID_KEYSTORE_PASSWORD")
+        keyAlias System.getenv("ANDROID_KEY_ALIAS")
+        keyPassword System.getenv("ANDROID_KEY_PASSWORD")
+    }
+'@
+    $text = $text -replace "signingConfigs\s*\{\s*", "signingConfigs {`n$releaseSigning"
+  }
+
+  $debugSigningLine = "            signingConfig signingConfigs.debug"
+  $firstSigningLine = $text.IndexOf($debugSigningLine)
+  $releaseSigningLine = if ($firstSigningLine -ge 0) {
+    $text.IndexOf($debugSigningLine, $firstSigningLine + $debugSigningLine.Length)
+  } else {
+    -1
+  }
+  if ($releaseSigningLine -lt 0) {
+    throw "Could not find generated release signingConfig line in $BuildGradlePath"
+  }
+  $text = $text.Remove($releaseSigningLine, $debugSigningLine.Length).Insert(
+    $releaseSigningLine,
+    "            signingConfig signingConfigs.release"
+  )
+  Set-Content -Path $BuildGradlePath -Value $text -NoNewline
+  Write-Host "Configured Android release signing from ANDROID_KEYSTORE_PATH"
+}
+
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $RepoRoot
 
@@ -108,6 +161,10 @@ $patchedWrapperText = $wrapperText -replace "gradle-[0-9.]+-bin\.zip", "gradle-8
 if ($patchedWrapperText -ne $wrapperText) {
   Set-Content -Path $wrapperProperties -Value $patchedWrapperText -NoNewline
   Write-Host "Pinned Gradle wrapper to 8.14.3"
+}
+
+if ($BuildType -eq "Release") {
+  Enable-ReleaseSigningFromEnv -BuildGradlePath (Join-Path $RepoRoot "apps/mobile/android/app/build.gradle")
 }
 
 $androidDir = Join-Path $RepoRoot "apps/mobile/android"
