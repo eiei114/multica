@@ -12,8 +12,18 @@
  *
  * Theme picker stays inline (3 fixed options, fits in one section).
  */
-import { Alert, ActivityIndicator, Pressable, ScrollView, View } from "react-native";
+import { useState } from "react";
+import {
+  Alert,
+  ActivityIndicator,
+  Linking,
+  Platform,
+  Pressable,
+  ScrollView,
+  View,
+} from "react-native";
 import { Ionicons } from "@expo/vector-icons";
+import Constants from "expo-constants";
 import { router } from "expo-router";
 import { useQuery } from "@tanstack/react-query";
 import type { Workspace } from "@multica/core/types";
@@ -31,6 +41,12 @@ import {
 } from "@/lib/use-color-scheme";
 import { THEME } from "@/lib/theme";
 import { cn } from "@/lib/utils";
+import {
+  androidApkDownloadUrl,
+  fetchLatestAndroidUpdateMetadata,
+  isNewerAndroidBuild,
+  normalizeAndroidUpdateRepo,
+} from "@/lib/android-update";
 
 const THEME_OPTIONS: Array<{ value: ThemePreference; label: string }> = [
   { value: "light", label: "Light" },
@@ -58,6 +74,14 @@ export default function SettingsPage() {
   const { data, isLoading, error } = useQuery(workspaceListOptions());
   const { preference, setPreference, colorScheme } = useColorScheme();
   const mutedFg = THEME[colorScheme].mutedForeground;
+  const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
+  const currentVersion = Constants.nativeAppVersion ?? Constants.expoConfig?.version ?? "0.1.0";
+  const currentBuild = Constants.nativeBuildVersion ?? String(Constants.expoConfig?.android?.versionCode ?? 1);
+  const androidUpdateRepo = normalizeAndroidUpdateRepo(
+    typeof Constants.expoConfig?.extra?.androidUpdateRepository === "string"
+      ? Constants.expoConfig.extra.androidUpdateRepository
+      : undefined,
+  );
 
   const onSwitch = async (ws: Workspace) => {
     if (ws.slug === currentSlug) return;
@@ -86,6 +110,50 @@ export default function SettingsPage() {
   const goProfile = () => router.push(`/${currentSlug}/more/settings/profile`);
   const goNotifications = () =>
     router.push(`/${currentSlug}/more/settings/notifications`);
+
+  const onCheckAndroidUpdate = async () => {
+    if (Platform.OS !== "android") {
+      Alert.alert("Android only", "APK updates are only available on Android.");
+      return;
+    }
+
+    setIsCheckingUpdate(true);
+    try {
+      const metadata = await fetchLatestAndroidUpdateMetadata(androidUpdateRepo);
+      const apkUrl = androidApkDownloadUrl(androidUpdateRepo, metadata.apk);
+
+      if (!isNewerAndroidBuild(currentBuild, metadata.versionCode)) {
+        Alert.alert(
+          "Multica is up to date",
+          `Current build: ${currentBuild}\nLatest build: ${metadata.versionCode}`,
+        );
+        return;
+      }
+
+      Alert.alert(
+        "Android update available",
+        `Current build: ${currentBuild}\nLatest build: ${metadata.versionCode}\n\nDownload the APK and approve Android's installer prompt to update.`,
+        [
+          { text: "Cancel", style: "cancel" },
+          {
+            text: "Download APK",
+            onPress: () => {
+              Linking.openURL(apkUrl).catch(() => {
+                Alert.alert("Couldn't open download", apkUrl);
+              });
+            },
+          },
+        ],
+      );
+    } catch (err) {
+      Alert.alert(
+        "Update check failed",
+        err instanceof Error ? err.message : "Unknown error",
+      );
+    } finally {
+      setIsCheckingUpdate(false);
+    }
+  };
 
   return (
     <ScrollView
@@ -184,12 +252,79 @@ export default function SettingsPage() {
         </RadioGroup>
       </SectionGroup>
 
+      {Platform.OS === "android" ? (
+        <SectionGroup title="App">
+          <InfoRow
+            title="Version"
+            value={`${currentVersion} (${currentBuild})`}
+          />
+          <Separator />
+          <UpdateRow
+            onPress={onCheckAndroidUpdate}
+            disabled={isCheckingUpdate}
+            isChecking={isCheckingUpdate}
+            title="Check for Android update"
+            subtitle={`Private fork: ${androidUpdateRepo}`}
+            iconColor={mutedFg}
+          />
+        </SectionGroup>
+      ) : null}
+
       <View className="pt-2">
         <Button variant="destructive" onPress={onSignOut}>
           <Text>Sign out</Text>
         </Button>
       </View>
     </ScrollView>
+  );
+}
+
+function InfoRow({ title, value }: { title: string; value: string }) {
+  return (
+    <View className="flex-row items-center px-4 py-3.5 gap-3">
+      <Text className="flex-1 text-base font-medium text-foreground">
+        {title}
+      </Text>
+      <Text className="text-sm text-muted-foreground text-right" numberOfLines={1}>
+        {value}
+      </Text>
+    </View>
+  );
+}
+
+function UpdateRow({
+  onPress,
+  disabled,
+  isChecking,
+  title,
+  subtitle,
+  iconColor,
+}: {
+  onPress: () => void;
+  disabled: boolean;
+  isChecking: boolean;
+  title: string;
+  subtitle: string;
+  iconColor: string;
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      disabled={disabled}
+      className="flex-row items-center px-4 py-3.5 active:bg-secondary gap-3 disabled:opacity-60"
+    >
+      <View className="flex-1">
+        <Text className="text-base font-medium text-foreground">{title}</Text>
+        <Text className="text-sm text-muted-foreground mt-0.5">
+          {subtitle}
+        </Text>
+      </View>
+      {isChecking ? (
+        <ActivityIndicator />
+      ) : (
+        <Ionicons name="download-outline" size={18} color={iconColor} />
+      )}
+    </Pressable>
   );
 }
 

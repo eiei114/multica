@@ -84,6 +84,10 @@ export default ({ config }: ConfigContext): ExpoConfig => {
         },
       ],
     ],
-    extra: { APP_ENV: env },
+    extra: {
+      APP_ENV: env,
+      androidUpdateRepository:
+        process.env.EXPO_ANDROID_UPDATE_REPO ?? "eiei114/multica",
+    },
   };
 };
