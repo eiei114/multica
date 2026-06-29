@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-Build the Expo Android development-client APK on Windows.
+Build the Expo Android APK on Windows or GitHub Actions Windows runners.
 
 .DESCRIPTION
 This script captures the local Windows workarounds needed for the current
@@ -11,8 +11,8 @@ Multica mobile Android build:
 - pin the generated Gradle wrapper to 8.14.3
 - build only arm64-v8a by default to avoid x86 native-module failures
 
-The produced APK is a debug development build. Use run-mobile-prod.ps1 to run
-the JavaScript bundle against https://api.multica.ai.
+Debug builds are development-client APKs. Release builds embed the JavaScript
+bundle and can be used without a local Metro server.
 #>
 
 [CmdletBinding()]
@@ -21,6 +21,9 @@ param(
   [string]$AppEnvironment = "development",
 
   [string]$Architecture = "arm64-v8a",
+
+  [ValidateSet("Debug", "Release")]
+  [string]$BuildType = "Debug",
 
   [switch]$CleanPrebuild,
   [switch]$SkipPrebuild,
@@ -115,14 +118,17 @@ try {
     throw "gradlew.bat not found: $gradlew"
   }
 
-  Write-Host "Building debug APK..."
-  & $gradlew assembleDebug "-PreactNativeArchitectures=$Architecture" --no-daemon --stacktrace
+  $gradleTask = if ($BuildType -eq "Release") { "assembleRelease" } else { "assembleDebug" }
+  Write-Host "Building Android APK with Gradle task: $gradleTask"
+  & $gradlew $gradleTask "-PreactNativeArchitectures=$Architecture" --no-daemon --stacktrace
 }
 finally {
   Pop-Location
 }
 
-$apk = Join-Path $RepoRoot "apps/mobile/android/app/build/outputs/apk/debug/app-debug.apk"
+$apkVariantDir = if ($BuildType -eq "Release") { "release" } else { "debug" }
+$apkName = if ($BuildType -eq "Release") { "app-release.apk" } else { "app-debug.apk" }
+$apk = Join-Path $RepoRoot "apps/mobile/android/app/build/outputs/apk/$apkVariantDir/$apkName"
 if (-not (Test-Path $apk)) {
   throw "APK not found after build: $apk"
 }
@@ -134,4 +140,3 @@ if ($Install) {
   Write-Host "Installing APK on connected Android device..."
   & adb install -r $apk
 }
-

@@ -13,6 +13,8 @@ export default ({ config }: ConfigContext): ExpoConfig => {
   const env = process.env.APP_ENV ?? "development";
   const isProd = env === "production";
   const isStaging = env === "staging";
+  const version = process.env.EXPO_APP_VERSION ?? "0.1.0";
+  const androidVersionCode = Number.parseInt(process.env.EXPO_ANDROID_VERSION_CODE ?? "1", 10);
 
   return {
     ...config,
@@ -22,7 +24,7 @@ export default ({ config }: ConfigContext): ExpoConfig => {
         ? "Multica (Staging)"
         : "Multica (Dev)",
     slug: "multica-mobile",
-    version: "0.1.0",
+    version,
     orientation: "portrait",
     userInterfaceStyle: "automatic",
     scheme: "multica",
@@ -53,6 +55,7 @@ export default ({ config }: ConfigContext): ExpoConfig => {
         : isStaging
           ? "ai.multica.mobile.staging"
           : (process.env.EXPO_ANDROID_PACKAGE_DEV ?? "ai.multica.mobile.dev"),
+      versionCode: Number.isFinite(androidVersionCode) ? androidVersionCode : 1,
     },
     plugins: [
       "expo-router",

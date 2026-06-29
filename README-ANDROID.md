@@ -104,6 +104,54 @@ powershell -ExecutionPolicy Bypass -File scripts/run-mobile-prod.ps1
 
 No APK rebuild is needed unless native inputs changed.
 
+## Automatic fork build flow
+
+`.github/workflows/android-auto-build.yml` runs on the fork only
+(`eiei114/multica`). It is intentionally not a general upstream workflow.
+
+The workflow:
+
+1. Checks out `android-build`.
+2. Merges `upstream/main` into it.
+3. Pushes the merge back to `origin/android-build` when upstream changed.
+4. Builds a production Android release APK on GitHub Actions.
+5. Uploads the APK as a workflow artifact.
+6. Publishes a GitHub Release with:
+   - `multica-android-<run_number>.apk`
+   - `android-update.json`
+
+The scheduled run is daily at `06:15 JST`.
+
+For the scheduled run to work, the fork's default branch should be
+`android-build`, because GitHub only runs scheduled workflows from the default
+branch.
+
+Manual run:
+
+```powershell
+gh workflow run android-auto-build.yml --repo eiei114/multica --ref android-build
+```
+
+The private fork APK uses this package id by default:
+
+```text
+ai.multica.mobile.eiei114
+```
+
+That means it installs separately from the current development-client APK
+(`ai.multica.mobile.dev`). This is deliberate: the automated APK is a
+standalone production bundle, while the dev APK is for Metro-based local work.
+
+If the upstream merge conflicts, the workflow fails and leaves the branch
+unchanged. Resolve locally:
+
+```powershell
+git fetch upstream
+git switch android-build
+git merge upstream/main
+git push origin android-build
+```
+
 ## Rebuild APK when native inputs change
 
 Rebuild after changes to any of these:

@@ -1,0 +1,168 @@
+name: Android Auto Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Build even when upstream/main did not change"
+        type: boolean
+        default: true
+      publish_release:
+        description: "Publish the APK to a GitHub Release"
+        type: boolean
+        default: true
+      package_id:
+        description: "Android applicationId for the private fork build"
+        type: string
+        default: "ai.multica.mobile.eiei114"
+  schedule:
+    # 06:15 JST. GitHub may delay scheduled workflows by several minutes.
+    - cron: "15 21 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-auto-build
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync upstream/main into android-build
+    if: github.repository == 'eiei114/multica'
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      head_sha: ${{ steps.sync.outputs.head_sha }}
+      short_sha: ${{ steps.sync.outputs.short_sha }}
+    steps:
+      - name: Checkout android-build
+        uses: actions/checkout@v6
+        with:
+          ref: android-build
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge upstream/main
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/multica-ai/multica.git || true
+          git fetch upstream main
+
+          before="$(git rev-parse HEAD)"
+          if git merge --no-edit upstream/main; then
+            after="$(git rev-parse HEAD)"
+            if [ "$before" != "$after" ]; then
+              git push origin HEAD:android-build
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+            fi
+            echo "head_sha=$after" >> "$GITHUB_OUTPUT"
+            echo "short_sha=${after:0:12}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Upstream merge conflict. Resolve locally with: git fetch upstream && git merge upstream/main" >&2
+            git status --short >&2 || true
+            exit 1
+          fi
+
+  build:
+    name: Build production Android APK
+    needs: sync
+    if: >-
+      github.repository == 'eiei114/multica' &&
+      (needs.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch' && inputs.force_build)
+    runs-on: windows-latest
+    env:
+      APP_ENV: production
+      EXPO_ANDROID_PACKAGE_PROD: ${{ inputs.package_id || 'ai.multica.mobile.eiei114' }}
+      EXPO_BUNDLE_IDENTIFIER_PROD: ai.multica.mobile.eiei114
+      EXPO_ANDROID_VERSION_CODE: ${{ github.run_number }}
+      EXPO_APP_VERSION: 0.1.0-android.${{ github.run_number }}
+    steps:
+      - name: Checkout android-build
+        uses: actions/checkout@v6
+        with:
+          ref: android-build
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build release APK
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts/build-android-debug.ps1 `
+            -AppEnvironment production `
+            -BuildType Release
+
+      - name: Stage APK and update metadata
+        id: package
+        shell: pwsh
+        run: |
+          $artifactDir = "artifacts/android"
+          New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
+
+          $apkSource = "apps/mobile/android/app/build/outputs/apk/release/app-release.apk"
+          $apkName = "multica-android-${{ github.run_number }}.apk"
+          $apkDest = Join-Path $artifactDir $apkName
+          $metadataPath = Join-Path $artifactDir "android-update.json"
+          Copy-Item $apkSource $apkDest -Force
+
+          $metadata = [ordered]@{
+            versionCode = [int]"${{ github.run_number }}"
+            versionName = "0.1.0-android.${{ github.run_number }}"
+            packageId = "${{ env.EXPO_ANDROID_PACKAGE_PROD }}"
+            commit = "${{ needs.sync.outputs.head_sha }}"
+            branch = "android-build"
+            builtAt = (Get-Date).ToUniversalTime().ToString("o")
+            apk = $apkName
+          }
+          $metadata | ConvertTo-Json | Set-Content -Encoding UTF8 $metadataPath
+
+          "apk_path=$apkDest" >> $env:GITHUB_OUTPUT
+          "metadata_path=$metadataPath" >> $env:GITHUB_OUTPUT
+          "tag=android-${{ github.run_number }}" >> $env:GITHUB_OUTPUT
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: multica-android-${{ github.run_number }}
+          path: artifacts/android/*
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'schedule' || inputs.publish_release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.package.outputs.tag }}"
+          gh release create $tag `
+            "${{ steps.package.outputs.apk_path }}" `
+            "${{ steps.package.outputs.metadata_path }}" `
+            --repo "${{ github.repository }}" `
+            --target android-build `
+            --title "Android APK ${{ github.run_number }}" `
+            --notes "Automated private Android APK build from android-build at ${{ needs.sync.outputs.short_sha }}."
