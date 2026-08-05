@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -44,7 +43,22 @@ func buildCodebuddyArgs(opts ExecOptions, logger *slog.Logger) []string {
 		"--verbose",
 		"--strict-mcp-config",
 		"--permission-mode", "bypassPermissions",
-		"--disallowedTools", "AskUserQuestion",
+		// CodeBuddy's interactive tools have no UI to render in under the
+		// daemon's headless stream-json transport. AskUserQuestion and
+		// ExitPlanMode are both exempted from CodeBuddy's permission-mode
+		// finalization, so --permission-mode bypassPermissions does NOT
+		// auto-approve them — they always reach the permission bridge and
+		// stall the turn waiting for a confirmation nobody can give
+		// (GitHub #6012). EnterPlanMode is denied alongside them: leaving it
+		// enabled would let the model enter a plan mode it then has no tool
+		// to leave. Plan-shaped work still happens — the plan is written as
+		// ordinary assistant output instead of behind an approval gate.
+		//
+		// Pass one value per tool: --disallowedTools is variadic and
+		// CodeBuddy compares each entry against the tool name exactly
+		// (PermissionUtils.matchPermissionRules), so a comma-joined string
+		// would match nothing despite what the CLI's own help text claims.
+		"--disallowedTools", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
 	}
 	if opts.Model != "" {
 		args = append(args, "--model", opts.Model)
@@ -181,8 +195,7 @@ func (b *codebuddyBackend) Execute(ctx context.Context, prompt string, opts Exec
 			_ = stdout.Close()
 		}()
 
-		scanner := bufio.NewScanner(stdout)
-		scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
+		scanner := newAgentStreamScanner(stdout)
 
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
@@ -293,21 +306,23 @@ func (b *codebuddyBackend) Execute(ctx context.Context, prompt string, opts Exec
 
 		b.cfg.Logger.Info("codebuddy finished", "pid", cmd.Process.Pid, "status", finalStatus, "duration", duration.Round(time.Millisecond).String())
 
-		reportedSessionID := resolveSessionID(opts.ResumeSessionID, sessionID, finalStatus == "failed")
-		if reportedSessionID != sessionID {
-			b.cfg.Logger.Info("codebuddy resume did not land; clearing fresh session id for daemon fallback",
+		resumeRejected := resumeWasRejected(opts.ResumeSessionID, sessionID, finalStatus == "failed", finalError)
+		reportedSessionID := resolveSessionID(opts.ResumeSessionID, sessionID, finalStatus == "failed", finalError)
+		if resumeRejected {
+			b.cfg.Logger.Info("codebuddy resume was rejected; dropping session id and signalling fresh-session retry",
 				"requested_resume", opts.ResumeSessionID,
 				"emitted_session", sessionID,
 			)
 		}
 
 		resCh <- Result{
-			Status:     finalStatus,
-			Output:     finalOutput,
-			Error:      finalError,
-			DurationMs: duration.Milliseconds(),
-			SessionID:  reportedSessionID,
-			Usage:      usage,
+			Status:         finalStatus,
+			Output:         finalOutput,
+			Error:          finalError,
+			DurationMs:     duration.Milliseconds(),
+			SessionID:      reportedSessionID,
+			Usage:          usage,
+			ResumeRejected: resumeRejected,
 		}
 	}()
 
@@ -402,6 +417,11 @@ func (b *codebuddyBackend) handleControlRequest(msg codebuddySDKMessage, stdin i
 			"subtype":    "success",
 			"request_id": msg.RequestID,
 			"response": map[string]any{
+				// CodeBuddy's SdkPermissionClient reads `allowed` and treats a
+				// missing key as a denial; `behavior` is Claude Code's spelling,
+				// which the fork still honours on its other permission paths.
+				// Send both so an approval is never read as a silent reject.
+				"allowed":      true,
 				"behavior":     "allow",
 				"updatedInput": inputMap,
 			},

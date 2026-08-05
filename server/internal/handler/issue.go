@@ -18,6 +18,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/dispatch"
 	"github.com/multica-ai/multica/server/internal/issueguard"
 	"github.com/multica-ai/multica/server/internal/logger"
 	"github.com/multica-ai/multica/server/internal/middleware"
@@ -1890,9 +1891,10 @@ func (h *Handler) GetIssue(w http.ResponseWriter, r *http.Request) {
 		WorkspaceID: issue.WorkspaceID,
 	})
 	if err == nil && len(attachments) > 0 {
+		mode := attachmentURLModeFromRequest(r)
 		resp.Attachments = make([]AttachmentResponse, len(attachments))
 		for i, a := range attachments {
-			resp.Attachments[i] = h.attachmentToResponse(a)
+			resp.Attachments[i] = h.attachmentToResponse(a, mode)
 		}
 	}
 
@@ -1911,9 +1913,19 @@ func (h *Handler) ListChildIssues(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
+	ids := make([]pgtype.UUID, len(children))
+	for i, child := range children {
+		ids[i] = child.ID
+	}
+	labelsMap := h.labelsByIssue(r.Context(), issue.WorkspaceID, ids)
 	resp := make([]IssueResponse, len(children))
 	for i, child := range children {
 		resp[i] = issueToResponse(child, prefix)
+		labels := labelsMap[resp[i].ID]
+		if labels == nil {
+			labels = []LabelResponse{}
+		}
+		resp[i].Labels = &labels
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"issues": resp,
@@ -1980,9 +1992,19 @@ func (h *Handler) ListChildrenByParents(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	prefix := h.getIssuePrefix(r.Context(), wsUUID)
+	ids := make([]pgtype.UUID, len(children))
+	for i, child := range children {
+		ids[i] = child.ID
+	}
+	labelsMap := h.labelsByIssue(r.Context(), wsUUID, ids)
 	resp := make([]IssueResponse, len(children))
 	for i, child := range children {
 		resp[i] = issueToResponse(child, prefix)
+		labels := labelsMap[resp[i].ID]
+		if labels == nil {
+			labels = []LabelResponse{}
+		}
+		resp[i].Labels = &labels
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"issues": resp,
@@ -2171,11 +2193,11 @@ func (h *Handler) QuickCreateIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !agent.RuntimeID.Valid {
-		writeAgentUnavailable(w, "agent has no runtime")
+		writeAgentUnavailable(w, "agent has no runtime", ReasonAgentRuntimeRequired)
 		return
 	}
 	if !h.isRuntimeOnline(r.Context(), agent.RuntimeID) {
-		writeAgentUnavailable(w, "agent's runtime is offline")
+		writeAgentUnavailable(w, "agent's runtime is offline", ReasonRuntimeOffline)
 		return
 	}
 
@@ -2259,12 +2281,17 @@ func (h *Handler) QuickCreateIssue(w http.ResponseWriter, r *http.Request) {
 
 // writeAgentUnavailable returns 422 with a stable error code so the modal
 // can show a "switch agent" hint without parsing the human-readable reason.
-func writeAgentUnavailable(w http.ResponseWriter, reason string) {
+// writeAgentUnavailable refuses a trigger whose agent cannot run. `code` stays
+// agent_unavailable for installed clients; reason_code carries the machine-
+// readable distinction they need to phrase the fix — agent_runtime_required
+// ("bind a runtime") is not runtime_offline ("reconnect the machine").
+func writeAgentUnavailable(w http.ResponseWriter, reason string, reasonCode dispatch.ReasonCode) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusUnprocessableEntity)
 	json.NewEncoder(w).Encode(map[string]any{
-		"code":   "agent_unavailable",
-		"reason": reason,
+		"code":        "agent_unavailable",
+		"reason":      reason,
+		"reason_code": reasonCode,
 	})
 }
 
@@ -2562,13 +2589,14 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		analyticsAgentID = actualCreatorID
 	}
 
+	attachmentMode := attachmentURLModeFromRequest(r)
 	buildAttachmentResponses := func(atts []db.Attachment) []AttachmentResponse {
 		if len(atts) == 0 {
 			return nil
 		}
 		out := make([]AttachmentResponse, len(atts))
 		for i, a := range atts {
-			out[i] = h.attachmentToResponse(a)
+			out[i] = h.attachmentToResponse(a, attachmentMode)
 		}
 		return out
 	}

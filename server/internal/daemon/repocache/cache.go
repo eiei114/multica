@@ -208,11 +208,64 @@ func (c *Cache) Sync(workspaceID string, repos []RepoInfo) error {
 // Lookup returns the local bare clone path for a repo URL within a workspace.
 // Returns "" if not cached.
 func (c *Cache) Lookup(workspaceID, url string) string {
-	barePath := filepath.Join(c.root, workspaceID, bareDirName(url))
+	barePath := c.BarePath(workspaceID, url)
 	if isBareRepo(barePath) {
 		return barePath
 	}
 	return ""
+}
+
+// BarePath returns where a repo's bare cache lives, whether or not it exists
+// yet. Lookup is the "is it cached?" question; this is the "where would it be?"
+// question, which the GC needs to map a set of live repo URLs onto the
+// directories it is about to consider evicting.
+func (c *Cache) BarePath(workspaceID, url string) string {
+	return filepath.Join(c.root, workspaceID, bareDirName(url))
+}
+
+// lastUsedFile records the last time a task asked for a worktree from this
+// bare repo. It lives inside the bare repo so it is removed with it.
+//
+// Directory mtime cannot answer this question. Every daemon restart re-syncs
+// each registered workspace's full repo list, and that path fetches every
+// cached repo (see Sync), refreshing the mtime of repos no task has checked
+// out in months. atime is worse: noatime is common on Linux and Windows
+// disables it by default. So the signal has to be written explicitly, at the
+// one place that means a repo was really used — CreateWorktree.
+const lastUsedFile = ".multica_last_used"
+
+// MarkUsed records that this bare repo was just used for a checkout. Callers
+// must already hold the repo lock. Best-effort: a failed stamp only risks the
+// repo looking idle later, and the GC's own missing-stamp grace period
+// (see LastUsed) absorbs that.
+func MarkUsed(barePath string, logger *slog.Logger) {
+	if barePath == "" {
+		return
+	}
+	stamp := time.Now().UTC().Format(time.RFC3339Nano)
+	if err := os.WriteFile(filepath.Join(barePath, lastUsedFile), []byte(stamp), 0o644); err != nil && logger != nil {
+		logger.Warn("repo cache: write last-used stamp failed", "repo", barePath, "error", err)
+	}
+}
+
+// LastUsed reports when this bare repo was last used for a checkout, and
+// whether a stamp existed at all.
+//
+// ok=false means "unknown", never "ancient". Every cache created before this
+// stamp existed reports unknown, so treating it as infinitely old would make
+// the first GC cycle after an upgrade wipe every repo cache on the machine and
+// force a full re-clone of each. Callers must stamp an unknown repo and let it
+// age from now.
+func LastUsed(barePath string) (time.Time, bool) {
+	data, err := os.ReadFile(filepath.Join(barePath, lastUsedFile))
+	if err != nil {
+		return time.Time{}, false
+	}
+	stamp, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(string(data)))
+	if err != nil {
+		return time.Time{}, false
+	}
+	return stamp, true
 }
 
 // WithRepoLock serializes caller-supplied mutations on a bare repo against all
@@ -463,6 +516,12 @@ func (c *Cache) CreateWorktree(params WorktreeParams) (*WorktreeResult, error) {
 	repoLock.Lock()
 	defer repoLock.Unlock()
 
+	// Stamp before doing the work, not after: a task asking for a worktree is
+	// what "this cache is still wanted" means, whether or not the checkout
+	// ultimately succeeds. Stamping only on success would let a repo whose
+	// checkouts keep failing age out from under the tasks still trying to use it.
+	MarkUsed(barePath, c.logger)
+
 	// Fetch latest from origin. This also migrates the bare cache's refspec
 	// to the modern remote-tracking layout on first run, so subsequent fetches
 	// never collide with the refs/heads/agent/* branches that worktree creation
@@ -644,6 +703,14 @@ func (c *Cache) createOrUpdateIsolatedCheckout(barePath, repoURL, checkoutPath, 
 		if err := setIsolatedCheckoutOrigin(checkoutPath, repoURL); err != nil {
 			return "", err
 		}
+		// Idempotent, and required for a workdir that was first created while
+		// the cache was still a full clone: without it, a checkout backed by a
+		// blobless cache resolves missing blobs to nothing instead of fetching.
+		if isPartialClone(barePath) {
+			if err := configurePromisorRemote(checkoutPath); err != nil {
+				return "", err
+			}
+		}
 		if err := syncIsolatedCheckoutRefs(barePath, checkoutPath, baseRef); err != nil {
 			return "", err
 		}
@@ -731,17 +798,30 @@ func createIsolatedCheckout(barePath, repoURL, checkoutPath, branchName, baseRef
 		}
 	}()
 
-	if out, err := runGitCombinedOutput("-C", checkoutPath, "checkout", "--detach", baseCommit); err != nil {
-		return "", fmt.Errorf("git checkout --detach: %s: %w", strings.TrimSpace(string(out)), err)
-	}
+	// The origin swap has to happen before the first checkout when the cache
+	// is a partial clone. `git clone --local` hardlinks the objects it can see
+	// and does NOT inherit the promisor configuration, so a blobless cache
+	// yields a checkout whose blobs are unreachable — and git reports that as
+	// success with every file "deleted" rather than as an error. Pointing
+	// origin at the real remote and restoring the promisor config first lets
+	// the checkout below lazily fetch what it needs.
 	if out, err := runGitCombinedOutput("-C", checkoutPath, "remote", "remove", isolatedCacheRemoteName); err != nil {
 		return "", fmt.Errorf("remove cache remote: %s: %w", strings.TrimSpace(string(out)), err)
 	}
-	if err := deleteAllLocalBranches(checkoutPath); err != nil {
-		return "", err
-	}
 	if out, err := runGitCombinedOutput("-C", checkoutPath, "remote", "add", "origin", repoURL); err != nil {
 		return "", fmt.Errorf("add origin remote: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	if isPartialClone(barePath) {
+		if err := configurePromisorRemote(checkoutPath); err != nil {
+			return "", err
+		}
+	}
+
+	if out, err := runGitCombinedOutput("-C", checkoutPath, "checkout", "--detach", baseCommit); err != nil {
+		return "", fmt.Errorf("git checkout --detach: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	if err := deleteAllLocalBranches(checkoutPath); err != nil {
+		return "", err
 	}
 	if err := syncIsolatedCheckoutRefs(barePath, checkoutPath, baseRef); err != nil {
 		return "", err
@@ -777,6 +857,39 @@ func isIsolatedCheckout(path string) bool {
 	}
 	out, err := runGitOutput("-C", path, "config", "--get", isolatedCheckoutConfigKey)
 	return err == nil && strings.TrimSpace(string(out)) == isolatedCheckoutConfigValue
+}
+
+// partialCloneFilter is the object filter a blobless partial clone is created
+// with, and the value that has to be restored on any repository that inherits
+// such a clone's incomplete object store.
+const partialCloneFilter = "blob:none"
+
+// isPartialClone reports whether a repository was created as a partial clone,
+// i.e. whether git will lazily fetch missing objects from its promisor remote.
+func isPartialClone(repoPath string) bool {
+	out, err := runGitOutputWithTimeout(30*time.Second, "-C", repoPath, "config", "--get", "remote.origin.promisor")
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == "true"
+}
+
+// configurePromisorRemote marks origin as the promisor remote for a repository
+// whose object store is incomplete, so git lazily fetches missing blobs from
+// the real remote instead of failing. It mirrors the two config keys
+// `git clone --filter=blob:none` writes; `git clone --local` does not copy
+// them across, which is why they have to be restored by hand.
+func configurePromisorRemote(repoPath string) error {
+	settings := [][2]string{
+		{"remote.origin.promisor", "true"},
+		{"remote.origin.partialclonefilter", partialCloneFilter},
+	}
+	for _, kv := range settings {
+		if out, err := runGitCombinedOutput("-C", repoPath, "config", kv[0], kv[1]); err != nil {
+			return fmt.Errorf("set %s: %s: %w", kv[0], strings.TrimSpace(string(out)), err)
+		}
+	}
+	return nil
 }
 
 func setIsolatedCheckoutOrigin(path, repoURL string) error {
